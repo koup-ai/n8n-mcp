@@ -398,22 +398,32 @@ export async function startFixedHTTPServer() {
               break;
               
             case 'tools/call':
-              // Delegate to the MCP server
+              // Delegate to the MCP server's tool handler
               const toolName = jsonRpcRequest.params?.name;
               const toolArgs = jsonRpcRequest.params?.arguments || {};
-              
+
               try {
-                const result = await mcpServer.executeTool(toolName, toolArgs);
+                // Call the MCP server's internal handler which returns formatted response
+                // with content and optionally structuredContent
+                const toolRequest = {
+                  method: 'tools/call',
+                  params: {
+                    name: toolName,
+                    arguments: toolArgs
+                  }
+                };
+
+                // Get the handler and call it
+                const handler = (mcpServer as any).server?._requestHandlers?.get('tools/call');
+                if (!handler) {
+                  throw new Error('Tool handler not found');
+                }
+
+                const mcpResult = await handler(toolRequest);
+
                 response = {
                   jsonrpc: '2.0',
-                  result: {
-                    content: [
-                      {
-                        type: 'text',
-                        text: JSON.stringify(result, null, 2)
-                      }
-                    ]
-                  },
+                  result: mcpResult, // This contains content and optionally structuredContent
                   id: jsonRpcRequest.id
                 };
               } catch (error) {

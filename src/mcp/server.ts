@@ -478,14 +478,15 @@ export class N8NDocumentationMCPServer {
         // Ensure the result is properly formatted for MCP
         let responseText: string;
         let structuredContent: any = null;
-        
+
         try {
           // For validation tools, check if we should use structured content
           if (name.startsWith('validate_') && typeof result === 'object' && result !== null) {
             // Clean up the result to ensure it matches the outputSchema
             const cleanResult = this.sanitizeValidationResult(result, name);
             structuredContent = cleanResult;
-            responseText = JSON.stringify(cleanResult, null, 2);
+            // When using structuredContent, provide a brief summary in content instead of duplicating data
+            responseText = `Validation result for ${cleanResult.displayName || cleanResult.nodeType}: ${cleanResult.valid ? 'valid' : 'invalid'}`;
           } else {
             responseText = typeof result === 'string' ? result : JSON.stringify(result, null, 2);
           }
@@ -493,14 +494,14 @@ export class N8NDocumentationMCPServer {
           logger.warn(`Failed to stringify tool result for ${name}:`, jsonError);
           responseText = String(result);
         }
-        
+
         // Validate response size (n8n might have limits)
         if (responseText.length > 1000000) { // 1MB limit
           logger.warn(`Tool ${name} response is very large (${responseText.length} chars), truncating`);
           responseText = responseText.substring(0, 999000) + '\n\n[Response truncated due to size limits]';
           structuredContent = null; // Don't use structured content for truncated responses
         }
-        
+
         // Build MCP response with strict schema compliance
         const mcpResponse: any = {
           content: [
@@ -510,12 +511,12 @@ export class N8NDocumentationMCPServer {
             },
           ],
         };
-        
+
         // For tools with outputSchema, structuredContent is REQUIRED by MCP spec
         if (name.startsWith('validate_') && structuredContent !== null) {
           mcpResponse.structuredContent = structuredContent;
         }
-        
+
         return mcpResponse;
       } catch (error) {
         logger.error(`Error executing tool ${name}`, error);
