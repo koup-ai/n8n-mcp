@@ -14,7 +14,8 @@ vi.mock('@/services/node-specific-validators', () => ({
     validateMongoDB: vi.fn(),
     validateWebhook: vi.fn(),
     validatePostgres: vi.fn(),
-    validateMySQL: vi.fn()
+    validateMySQL: vi.fn(),
+    validateAIAgent: vi.fn()
   }
 }));
 
@@ -800,6 +801,371 @@ describe('EnhancedConfigValidator', () => {
       // Should keep the one with undefined in message
       expect(result.errors).toHaveLength(1);
       expect(result.errors[0].property).toBe('test');
+    });
+  });
+
+  describe('enhanceHttpRequestValidation', () => {
+    it('should suggest alwaysOutputData for HTTP Request nodes', () => {
+      const nodeType = 'nodes-base.httpRequest';
+      const config = {
+        url: 'https://api.example.com/data',
+        method: 'GET'
+      };
+      const properties = [
+        { name: 'url', type: 'string', required: true },
+        { name: 'method', type: 'options', required: false }
+      ];
+
+      const result = EnhancedConfigValidator.validateWithMode(
+        nodeType,
+        config,
+        properties,
+        'operation',
+        'ai-friendly'
+      );
+
+      expect(result.valid).toBe(true);
+      expect(result.suggestions).toContainEqual(
+        expect.stringContaining('alwaysOutputData: true at node level')
+      );
+      expect(result.suggestions).toContainEqual(
+        expect.stringContaining('ensures the node produces output even when HTTP requests fail')
+      );
+    });
+
+    it('should suggest responseFormat for API endpoint URLs', () => {
+      const nodeType = 'nodes-base.httpRequest';
+      const config = {
+        url: 'https://api.example.com/data',
+        method: 'GET',
+        options: {} // Empty options, no responseFormat
+      };
+      const properties = [
+        { name: 'url', type: 'string', required: true },
+        { name: 'method', type: 'options', required: false },
+        { name: 'options', type: 'collection', required: false }
+      ];
+
+      const result = EnhancedConfigValidator.validateWithMode(
+        nodeType,
+        config,
+        properties,
+        'operation',
+        'ai-friendly'
+      );
+
+      expect(result.valid).toBe(true);
+      expect(result.suggestions).toContainEqual(
+        expect.stringContaining('responseFormat')
+      );
+      expect(result.suggestions).toContainEqual(
+        expect.stringContaining('options.response.response.responseFormat')
+      );
+    });
+
+    it('should suggest responseFormat for Supabase URLs', () => {
+      const nodeType = 'nodes-base.httpRequest';
+      const config = {
+        url: 'https://xxciwnthnnywanbplqwg.supabase.co/rest/v1/messages',
+        method: 'GET',
+        options: {}
+      };
+      const properties = [
+        { name: 'url', type: 'string', required: true }
+      ];
+
+      const result = EnhancedConfigValidator.validateWithMode(
+        nodeType,
+        config,
+        properties,
+        'operation',
+        'ai-friendly'
+      );
+
+      expect(result.suggestions).toContainEqual(
+        expect.stringContaining('responseFormat')
+      );
+    });
+
+    it('should NOT suggest responseFormat when already configured', () => {
+      const nodeType = 'nodes-base.httpRequest';
+      const config = {
+        url: 'https://api.example.com/data',
+        method: 'GET',
+        options: {
+          response: {
+            response: {
+              responseFormat: 'json'
+            }
+          }
+        }
+      };
+      const properties = [
+        { name: 'url', type: 'string', required: true },
+        { name: 'options', type: 'collection', required: false }
+      ];
+
+      const result = EnhancedConfigValidator.validateWithMode(
+        nodeType,
+        config,
+        properties,
+        'operation',
+        'ai-friendly'
+      );
+
+      const responseFormatSuggestion = result.suggestions.find(
+        (s: string) => s.includes('responseFormat')
+      );
+      expect(responseFormatSuggestion).toBeUndefined();
+    });
+
+    it('should warn about missing protocol in expression-based URLs', () => {
+      const nodeType = 'nodes-base.httpRequest';
+      const config = {
+        url: '=www.{{ $json.domain }}.com',
+        method: 'GET'
+      };
+      const properties = [
+        { name: 'url', type: 'string', required: true }
+      ];
+
+      const result = EnhancedConfigValidator.validateWithMode(
+        nodeType,
+        config,
+        properties,
+        'operation',
+        'ai-friendly'
+      );
+
+      expect(result.warnings).toContainEqual(
+        expect.objectContaining({
+          type: 'invalid_value',
+          property: 'url',
+          message: expect.stringContaining('missing http:// or https://')
+        })
+      );
+    });
+
+    it('should warn about missing protocol in expressions with template markers', () => {
+      const nodeType = 'nodes-base.httpRequest';
+      const config = {
+        url: '={{ $json.domain }}/api/data',
+        method: 'GET'
+      };
+      const properties = [
+        { name: 'url', type: 'string', required: true }
+      ];
+
+      const result = EnhancedConfigValidator.validateWithMode(
+        nodeType,
+        config,
+        properties,
+        'operation',
+        'ai-friendly'
+      );
+
+      expect(result.warnings).toContainEqual(
+        expect.objectContaining({
+          type: 'invalid_value',
+          property: 'url',
+          message: expect.stringContaining('missing http:// or https://')
+        })
+      );
+    });
+
+    it('should NOT warn when expression includes http protocol', () => {
+      const nodeType = 'nodes-base.httpRequest';
+      const config = {
+        url: '={{ "https://" + $json.domain + ".com" }}',
+        method: 'GET'
+      };
+      const properties = [
+        { name: 'url', type: 'string', required: true }
+      ];
+
+      const result = EnhancedConfigValidator.validateWithMode(
+        nodeType,
+        config,
+        properties,
+        'operation',
+        'ai-friendly'
+      );
+
+      const urlWarning = result.warnings.find(
+        (w: any) => w.property === 'url' && w.message.includes('protocol')
+      );
+      expect(urlWarning).toBeUndefined();
+    });
+
+    it('should NOT suggest responseFormat for non-API URLs', () => {
+      const nodeType = 'nodes-base.httpRequest';
+      const config = {
+        url: 'https://example.com/page.html',
+        method: 'GET',
+        options: {}
+      };
+      const properties = [
+        { name: 'url', type: 'string', required: true }
+      ];
+
+      const result = EnhancedConfigValidator.validateWithMode(
+        nodeType,
+        config,
+        properties,
+        'operation',
+        'ai-friendly'
+      );
+
+      const responseFormatSuggestion = result.suggestions.find(
+        (s: string) => s.includes('responseFormat')
+      );
+      expect(responseFormatSuggestion).toBeUndefined();
+    });
+
+    it('should detect missing protocol in expressions with uppercase HTTP', () => {
+      const nodeType = 'nodes-base.httpRequest';
+      const config = {
+        url: '={{ "HTTP://" + $json.domain + ".com" }}',
+        method: 'GET'
+      };
+      const properties = [
+        { name: 'url', type: 'string', required: true }
+      ];
+
+      const result = EnhancedConfigValidator.validateWithMode(
+        nodeType,
+        config,
+        properties,
+        'operation',
+        'ai-friendly'
+      );
+
+      // Should NOT warn because HTTP:// is present (case-insensitive)
+      expect(result.warnings).toHaveLength(0);
+    });
+
+    it('should NOT suggest responseFormat for false positive URLs', () => {
+      const nodeType = 'nodes-base.httpRequest';
+      const testUrls = [
+        'https://example.com/therapist-directory',
+        'https://restaurant-bookings.com/reserve',
+        'https://forest-management.org/data'
+      ];
+
+      testUrls.forEach(url => {
+        const config = {
+          url,
+          method: 'GET',
+          options: {}
+        };
+        const properties = [
+          { name: 'url', type: 'string', required: true }
+        ];
+
+        const result = EnhancedConfigValidator.validateWithMode(
+          nodeType,
+          config,
+          properties,
+          'operation',
+          'ai-friendly'
+        );
+
+        const responseFormatSuggestion = result.suggestions.find(
+          (s: string) => s.includes('responseFormat')
+        );
+        expect(responseFormatSuggestion).toBeUndefined();
+      });
+    });
+
+    it('should suggest responseFormat for case-insensitive API paths', () => {
+      const nodeType = 'nodes-base.httpRequest';
+      const testUrls = [
+        'https://example.com/API/users',
+        'https://example.com/Rest/data',
+        'https://example.com/REST/v1/items'
+      ];
+
+      testUrls.forEach(url => {
+        const config = {
+          url,
+          method: 'GET',
+          options: {}
+        };
+        const properties = [
+          { name: 'url', type: 'string', required: true }
+        ];
+
+        const result = EnhancedConfigValidator.validateWithMode(
+          nodeType,
+          config,
+          properties,
+          'operation',
+          'ai-friendly'
+        );
+
+        expect(result.suggestions).toContainEqual(
+          expect.stringContaining('responseFormat')
+        );
+      });
+    });
+
+    it('should handle null and undefined URLs gracefully', () => {
+      const nodeType = 'nodes-base.httpRequest';
+      const testConfigs = [
+        { url: null, method: 'GET' },
+        { url: undefined, method: 'GET' },
+        { url: '', method: 'GET' }
+      ];
+
+      testConfigs.forEach(config => {
+        const properties = [
+          { name: 'url', type: 'string', required: true }
+        ];
+
+        expect(() => {
+          EnhancedConfigValidator.validateWithMode(
+            nodeType,
+            config,
+            properties,
+            'operation',
+            'ai-friendly'
+          );
+        }).not.toThrow();
+      });
+    });
+
+    describe('AI Agent node validation', () => {
+      it('should call validateAIAgent for AI Agent nodes', () => {
+        const nodeType = 'nodes-langchain.agent';
+        const config = {
+          promptType: 'define',
+          text: 'You are a helpful assistant'
+        };
+        const properties = [
+          { name: 'promptType', type: 'options', required: true },
+          { name: 'text', type: 'string', required: false }
+        ];
+
+        EnhancedConfigValidator.validateWithMode(
+          nodeType,
+          config,
+          properties,
+          'operation',
+          'ai-friendly'
+        );
+
+        // Verify the validator was called (fix for issue where it wasn't being called at all)
+        expect(NodeSpecificValidators.validateAIAgent).toHaveBeenCalledTimes(1);
+
+        // Verify it was called with a context object containing our config
+        const callArgs = (NodeSpecificValidators.validateAIAgent as any).mock.calls[0][0];
+        expect(callArgs).toHaveProperty('config');
+        expect(callArgs.config).toEqual(config);
+        expect(callArgs).toHaveProperty('errors');
+        expect(callArgs).toHaveProperty('warnings');
+        expect(callArgs).toHaveProperty('suggestions');
+        expect(callArgs).toHaveProperty('autofix');
+      });
     });
   });
 });

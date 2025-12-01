@@ -25,16 +25,25 @@ import {
   UpdateNameOperation,
   AddTagOperation,
   RemoveTagOperation,
+  ActivateWorkflowOperation,
+  DeactivateWorkflowOperation,
   CleanStaleConnectionsOperation,
   ReplaceConnectionsOperation
 } from '../types/workflow-diff';
 import { Workflow, WorkflowNode, WorkflowConnection } from '../types/n8n-api';
 import { Logger } from '../utils/logger';
 import { validateWorkflowNode, validateWorkflowConnections } from './n8n-validation';
+import { sanitizeNode, sanitizeWorkflowNodes } from './node-sanitizer';
+import { isActivatableTrigger } from '../utils/node-type-utils';
 
 const logger = new Logger({ prefix: '[WorkflowDiffEngine]' });
 
 export class WorkflowDiffEngine {
+  // Track node name changes during operations for connection reference updates
+  private renameMap: Map<string, string> = new Map();
+  // Track warnings during operation processing
+  private warnings: WorkflowDiffValidationError[] = [];
+
   /**
    * Apply diff operations to a workflow
    */
@@ -43,6 +52,10 @@ export class WorkflowDiffEngine {
     request: WorkflowDiffRequest
   ): Promise<WorkflowDiffResult> {
     try {
+      // Reset tracking for this diff operation
+      this.renameMap.clear();
+      this.warnings = [];
+
       // Clone workflow to avoid modifying original
       const workflowCopy = JSON.parse(JSON.stringify(workflow));
 
@@ -93,6 +106,12 @@ export class WorkflowDiffEngine {
           }
         }
 
+        // Update connection references after all node renames (even in continueOnError mode)
+        if (this.renameMap.size > 0 && appliedIndices.length > 0) {
+          this.updateConnectionReferences(workflowCopy);
+          logger.debug(`Auto-updated ${this.renameMap.size} node name references in connections (continueOnError mode)`);
+        }
+
         // If validateOnly flag is set, return success without applying
         if (request.validateOnly) {
           return {
@@ -101,6 +120,7 @@ export class WorkflowDiffEngine {
               ? 'Validation successful. All operations are valid.'
               : `Validation completed with ${errors.length} errors.`,
             errors: errors.length > 0 ? errors : undefined,
+            warnings: this.warnings.length > 0 ? this.warnings : undefined,
             applied: appliedIndices,
             failed: failedIndices
           };
@@ -113,6 +133,7 @@ export class WorkflowDiffEngine {
           operationsApplied: appliedIndices.length,
           message: `Applied ${appliedIndices.length} operations, ${failedIndices.length} failed (continueOnError mode)`,
           errors: errors.length > 0 ? errors : undefined,
+          warnings: this.warnings.length > 0 ? this.warnings : undefined,
           applied: appliedIndices,
           failed: failedIndices
         };
@@ -146,6 +167,12 @@ export class WorkflowDiffEngine {
           }
         }
 
+        // Update connection references after all node renames
+        if (this.renameMap.size > 0) {
+          this.updateConnectionReferences(workflowCopy);
+          logger.debug(`Auto-updated ${this.renameMap.size} node name references in connections`);
+        }
+
         // Pass 2: Validate and apply other operations (connections, metadata)
         for (const { operation, index } of otherOperations) {
           const error = this.validateOperation(workflowCopy, operation);
@@ -174,6 +201,13 @@ export class WorkflowDiffEngine {
           }
         }
 
+        // Sanitize ALL nodes in the workflow after operations are applied
+        // This ensures existing invalid nodes (e.g., binary operators with singleValue: true)
+        // are fixed automatically when any update is made to the workflow
+        workflowCopy.nodes = workflowCopy.nodes.map((node: WorkflowNode) => sanitizeNode(node));
+
+        logger.debug('Applied full-workflow sanitization to all nodes');
+
         // If validateOnly flag is set, return success without applying
         if (request.validateOnly) {
           return {
@@ -183,11 +217,23 @@ export class WorkflowDiffEngine {
         }
 
         const operationsApplied = request.operations.length;
+
+        // Extract activation flags from workflow object
+        const shouldActivate = (workflowCopy as any)._shouldActivate === true;
+        const shouldDeactivate = (workflowCopy as any)._shouldDeactivate === true;
+
+        // Clean up temporary flags
+        delete (workflowCopy as any)._shouldActivate;
+        delete (workflowCopy as any)._shouldDeactivate;
+
         return {
           success: true,
           workflow: workflowCopy,
           operationsApplied,
-          message: `Successfully applied ${operationsApplied} operations (${nodeOperations.length} node ops, ${otherOperations.length} other ops)`
+          message: `Successfully applied ${operationsApplied} operations (${nodeOperations.length} node ops, ${otherOperations.length} other ops)`,
+          warnings: this.warnings.length > 0 ? this.warnings : undefined,
+          shouldActivate: shouldActivate || undefined,
+          shouldDeactivate: shouldDeactivate || undefined
         };
       }
     } catch (error) {
@@ -230,6 +276,10 @@ export class WorkflowDiffEngine {
       case 'addTag':
       case 'removeTag':
         return null; // These are always valid
+      case 'activateWorkflow':
+        return this.validateActivateWorkflow(workflow, operation);
+      case 'deactivateWorkflow':
+        return this.validateDeactivateWorkflow(workflow, operation);
       case 'cleanStaleConnections':
         return this.validateCleanStaleConnections(workflow, operation);
       case 'replaceConnections':
@@ -282,6 +332,12 @@ export class WorkflowDiffEngine {
         break;
       case 'removeTag':
         this.applyRemoveTag(workflow, operation);
+        break;
+      case 'activateWorkflow':
+        this.applyActivateWorkflow(workflow, operation);
+        break;
+      case 'deactivateWorkflow':
+        this.applyDeactivateWorkflow(workflow, operation);
         break;
       case 'cleanStaleConnections':
         this.applyCleanStaleConnections(workflow, operation);
@@ -341,10 +397,38 @@ export class WorkflowDiffEngine {
   }
 
   private validateUpdateNode(workflow: Workflow, operation: UpdateNodeOperation): string | null {
+    // Check for common parameter mistake: "changes" instead of "updates" (Issue #392)
+    const operationAny = operation as any;
+    if (operationAny.changes && !operation.updates) {
+      return `Invalid parameter 'changes'. The updateNode operation requires 'updates' (not 'changes'). Example: {type: "updateNode", nodeId: "abc", updates: {name: "New Name", "parameters.url": "https://example.com"}}`;
+    }
+
+    // Check for missing required parameter
+    if (!operation.updates) {
+      return `Missing required parameter 'updates'. The updateNode operation requires an 'updates' object containing properties to modify. Example: {type: "updateNode", nodeId: "abc", updates: {name: "New Name"}}`;
+    }
+
     const node = this.findNode(workflow, operation.nodeId, operation.nodeName);
     if (!node) {
       return this.formatNodeNotFoundError(workflow, operation.nodeId || operation.nodeName || '', 'updateNode');
     }
+
+    // Check for name collision if renaming
+    if (operation.updates.name && operation.updates.name !== node.name) {
+      const normalizedNewName = this.normalizeNodeName(operation.updates.name);
+      const normalizedCurrentName = this.normalizeNodeName(node.name);
+
+      // Only check collision if the names are actually different after normalization
+      if (normalizedNewName !== normalizedCurrentName) {
+        const collision = workflow.nodes.find(n =>
+          n.id !== node.id && this.normalizeNodeName(n.name) === normalizedNewName
+        );
+        if (collision) {
+          return `Cannot rename node "${node.name}" to "${operation.updates.name}": A node with that name already exists (id: ${collision.id.substring(0, 8)}...). Please choose a different name.`;
+        }
+      }
+    }
+
     return null;
   }
 
@@ -526,8 +610,11 @@ export class WorkflowDiffEngine {
       alwaysOutputData: operation.node.alwaysOutputData,
       executeOnce: operation.node.executeOnce
     };
-    
-    workflow.nodes.push(newNode);
+
+    // Sanitize node to ensure complete metadata (filter options, operator structure, etc.)
+    const sanitizedNode = sanitizeNode(newNode);
+
+    workflow.nodes.push(sanitizedNode);
   }
 
   private applyRemoveNode(workflow: Workflow, operation: RemoveNodeOperation): void {
@@ -567,11 +654,25 @@ export class WorkflowDiffEngine {
   private applyUpdateNode(workflow: Workflow, operation: UpdateNodeOperation): void {
     const node = this.findNode(workflow, operation.nodeId, operation.nodeName);
     if (!node) return;
-    
+
+    // Track node renames for connection reference updates
+    if (operation.updates.name && operation.updates.name !== node.name) {
+      const oldName = node.name;
+      const newName = operation.updates.name;
+      this.renameMap.set(oldName, newName);
+      logger.debug(`Tracking rename: "${oldName}" → "${newName}"`);
+    }
+
     // Apply updates using dot notation
     Object.entries(operation.updates).forEach(([path, value]) => {
       this.setNestedProperty(node, path, value);
     });
+
+    // Sanitize node after updates to ensure metadata is complete
+    const sanitized = sanitizeNode(node);
+
+    // Update the node in-place
+    Object.assign(node, sanitized);
   }
 
   private applyMoveNode(workflow: Workflow, operation: MoveNodeOperation): void {
@@ -623,6 +724,24 @@ export class WorkflowDiffEngine {
     if (operation.case !== undefined && operation.sourceIndex === undefined) {
       // Only apply if sourceIndex not explicitly set
       sourceIndex = operation.case;
+    }
+
+    // Validation: Warn if using sourceIndex with If/Switch nodes without smart parameters
+    if (sourceNode && operation.sourceIndex !== undefined && operation.branch === undefined && operation.case === undefined) {
+      if (sourceNode.type === 'n8n-nodes-base.if') {
+        this.warnings.push({
+          operation: -1,  // Not tied to specific operation index in request
+          message: `Connection to If node "${operation.source}" uses sourceIndex=${operation.sourceIndex}. ` +
+            `Consider using branch="true" or branch="false" for better clarity. ` +
+            `If node outputs: main[0]=TRUE branch, main[1]=FALSE branch.`
+        });
+      } else if (sourceNode.type === 'n8n-nodes-base.switch') {
+        this.warnings.push({
+          operation: -1,  // Not tied to specific operation index in request
+          message: `Connection to Switch node "${operation.source}" uses sourceIndex=${operation.sourceIndex}. ` +
+            `Consider using case=N for better clarity (case=0 for first output, case=1 for second, etc.).`
+        });
+      }
     }
 
     return { sourceOutput, sourceIndex };
@@ -742,10 +861,14 @@ export class WorkflowDiffEngine {
 
   // Metadata operation appliers
   private applyUpdateSettings(workflow: Workflow, operation: UpdateSettingsOperation): void {
-    if (!workflow.settings) {
-      workflow.settings = {};
+    // Only create/update settings if operation provides actual properties
+    // This prevents creating empty settings objects that would be rejected by n8n API
+    if (operation.settings && Object.keys(operation.settings).length > 0) {
+      if (!workflow.settings) {
+        workflow.settings = {};
+      }
+      Object.assign(workflow.settings, operation.settings);
     }
-    Object.assign(workflow.settings, operation.settings);
   }
 
   private applyUpdateName(workflow: Workflow, operation: UpdateNameOperation): void {
@@ -763,11 +886,44 @@ export class WorkflowDiffEngine {
 
   private applyRemoveTag(workflow: Workflow, operation: RemoveTagOperation): void {
     if (!workflow.tags) return;
-    
+
     const index = workflow.tags.indexOf(operation.tag);
     if (index !== -1) {
       workflow.tags.splice(index, 1);
     }
+  }
+
+  // Workflow activation operation validators
+  private validateActivateWorkflow(workflow: Workflow, operation: ActivateWorkflowOperation): string | null {
+    // Check if workflow has at least one activatable trigger
+    // Issue #351: executeWorkflowTrigger cannot activate workflows
+    const activatableTriggers = workflow.nodes.filter(
+      node => !node.disabled && isActivatableTrigger(node.type)
+    );
+
+    if (activatableTriggers.length === 0) {
+      return 'Cannot activate workflow: No activatable trigger nodes found. Workflows must have at least one enabled trigger node (webhook, schedule, email, etc.). Note: executeWorkflowTrigger cannot activate workflows as they can only be invoked by other workflows.';
+    }
+
+    return null;
+  }
+
+  private validateDeactivateWorkflow(workflow: Workflow, operation: DeactivateWorkflowOperation): string | null {
+    // Deactivation is always valid - any workflow can be deactivated
+    return null;
+  }
+
+  // Workflow activation operation appliers
+  private applyActivateWorkflow(workflow: Workflow, operation: ActivateWorkflowOperation): void {
+    // Set flag in workflow object to indicate activation intent
+    // The handler will call the API method after workflow update
+    (workflow as any)._shouldActivate = true;
+  }
+
+  private applyDeactivateWorkflow(workflow: Workflow, operation: DeactivateWorkflowOperation): void {
+    // Set flag in workflow object to indicate deactivation intent
+    // The handler will call the API method after workflow update
+    (workflow as any)._shouldDeactivate = true;
   }
 
   // Connection cleanup operation validators
@@ -878,6 +1034,59 @@ export class WorkflowDiffEngine {
 
   private applyReplaceConnections(workflow: Workflow, operation: ReplaceConnectionsOperation): void {
     workflow.connections = operation.connections;
+  }
+
+  /**
+   * Update all connection references when nodes are renamed.
+   * This method is called after node operations to ensure connection integrity.
+   *
+   * Updates:
+   * - Connection object keys (source node names)
+   * - Connection target.node values (target node names)
+   * - All output types (main, error, ai_tool, ai_languageModel, etc.)
+   *
+   * @param workflow - The workflow to update
+   */
+  private updateConnectionReferences(workflow: Workflow): void {
+    if (this.renameMap.size === 0) return;
+
+    logger.debug(`Updating connection references for ${this.renameMap.size} renamed nodes`);
+
+    // Create a mapping of all renames (old → new)
+    const renames = new Map(this.renameMap);
+
+    // Step 1: Update connection object keys (source node names)
+    const updatedConnections: WorkflowConnection = {};
+    for (const [sourceName, outputs] of Object.entries(workflow.connections)) {
+      // Check if this source node was renamed
+      const newSourceName = renames.get(sourceName) || sourceName;
+      updatedConnections[newSourceName] = outputs;
+    }
+
+    // Step 2: Update target node references within connections
+    for (const [sourceName, outputs] of Object.entries(updatedConnections)) {
+      // Iterate through all output types (main, error, ai_tool, ai_languageModel, etc.)
+      for (const [outputType, connections] of Object.entries(outputs)) {
+        // connections is Array<Array<{node, type, index}>>
+        for (let outputIndex = 0; outputIndex < connections.length; outputIndex++) {
+          const connectionsAtIndex = connections[outputIndex];
+          for (let connIndex = 0; connIndex < connectionsAtIndex.length; connIndex++) {
+            const connection = connectionsAtIndex[connIndex];
+            // Check if target node was renamed
+            if (renames.has(connection.node)) {
+              const newTargetName = renames.get(connection.node)!;
+              connection.node = newTargetName;
+              logger.debug(`Updated connection: ${sourceName}[${outputType}][${outputIndex}][${connIndex}].node: "${connection.node}" → "${newTargetName}"`);
+            }
+          }
+        }
+      }
+    }
+
+    // Replace workflow connections with updated connections
+    workflow.connections = updatedConnections;
+
+    logger.info(`Auto-updated ${this.renameMap.size} node name references in connections`);
   }
 
   // Helper methods

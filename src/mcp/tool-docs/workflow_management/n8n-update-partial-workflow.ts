@@ -4,11 +4,13 @@ export const n8nUpdatePartialWorkflowDoc: ToolDocumentation = {
   name: 'n8n_update_partial_workflow',
   category: 'workflow_management',
   essentials: {
-    description: 'Update workflow incrementally with diff operations. Types: addNode, removeNode, updateNode, moveNode, enable/disableNode, addConnection, removeConnection, rewireConnection, cleanStaleConnections, replaceConnections, updateSettings, updateName, add/removeTag. Supports smart parameters (branch, case) for multi-output nodes. Full support for AI connections (ai_languageModel, ai_tool, ai_memory, ai_embedding, ai_vectorStore, ai_document, ai_textSplitter, ai_outputParser).',
+    description: 'Update workflow incrementally with diff operations. Types: addNode, removeNode, updateNode, moveNode, enable/disableNode, addConnection, removeConnection, rewireConnection, cleanStaleConnections, replaceConnections, updateSettings, updateName, add/removeTag, activateWorkflow, deactivateWorkflow. Supports smart parameters (branch, case) for multi-output nodes. Full support for AI connections (ai_languageModel, ai_tool, ai_memory, ai_embedding, ai_vectorStore, ai_document, ai_textSplitter, ai_outputParser).',
     keyParameters: ['id', 'operations', 'continueOnError'],
     example: 'n8n_update_partial_workflow({id: "wf_123", operations: [{type: "rewireConnection", source: "IF", from: "Old", to: "New", branch: "true"}]})',
     performance: 'Fast (50-200ms)',
     tips: [
+      'ALWAYS provide intent parameter describing what you\'re doing (e.g., "Add error handling", "Fix webhook URL", "Connect Slack to error output")',
+      'DON\'T use generic intent like "update workflow" or "partial update" - be specific about your goal',
       'Use rewireConnection to change connection targets',
       'Use branch="true"/"false" for IF nodes',
       'Use case=N for Switch nodes',
@@ -17,11 +19,14 @@ export const n8nUpdatePartialWorkflowDoc: ToolDocumentation = {
       'Use continueOnError mode for best-effort bulk operations',
       'Validate with validateOnly first',
       'For AI connections, specify sourceOutput type (ai_languageModel, ai_tool, etc.)',
-      'Batch AI component connections for atomic updates'
+      'Batch AI component connections for atomic updates',
+      'Auto-sanitization: ALL nodes auto-fixed during updates (operator structures, missing metadata)',
+      'Node renames automatically update all connection references - no manual connection operations needed',
+      'Activate/deactivate workflows: Use activateWorkflow/deactivateWorkflow operations (requires activatable triggers like webhook/schedule)'
     ]
   },
   full: {
-    description: `Updates workflows using surgical diff operations instead of full replacement. Supports 15 operation types for precise modifications. Operations are validated and applied atomically by default - all succeed or none are applied.
+    description: `Updates workflows using surgical diff operations instead of full replacement. Supports 17 operation types for precise modifications. Operations are validated and applied atomically by default - all succeed or none are applied.
 
 ## Available Operations:
 
@@ -45,6 +50,10 @@ export const n8nUpdatePartialWorkflowDoc: ToolDocumentation = {
 - **updateName**: Rename the workflow
 - **addTag**: Add a workflow tag
 - **removeTag**: Remove a workflow tag
+
+### Workflow Activation Operations (2 types):
+- **activateWorkflow**: Activate the workflow to enable automatic execution via triggers
+- **deactivateWorkflow**: Deactivate the workflow to prevent automatic execution
 
 ## Smart Parameters for Multi-Output Nodes
 
@@ -79,6 +88,9 @@ Full support for all 8 AI connection types used in n8n AI workflows:
 - Multiple tools: Batch multiple \`sourceOutput: "ai_tool"\` connections to one AI Agent
 - Vector retrieval: Chain ai_embedding → ai_vectorStore → ai_tool → AI Agent
 
+**Important Notes**:
+- **AI nodes do NOT require main connections**: Nodes like OpenAI Chat Model, Postgres Chat Memory, Embeddings OpenAI, and Supabase Vector Store use AI-specific connection types exclusively. They should ONLY have connections like \`ai_languageModel\`, \`ai_memory\`, \`ai_embedding\`, or \`ai_tool\` - NOT \`main\` connections.
+
 **Best Practices**:
 - Always specify \`sourceOutput\` for AI connections (defaults to "main" if omitted)
 - Connect language model BEFORE creating/enabling AI Agent (validation requirement)
@@ -94,7 +106,201 @@ The **cleanStaleConnections** operation automatically removes broken connection 
 Set **continueOnError: true** to apply valid operations even if some fail. Returns detailed results showing which operations succeeded/failed. Perfect for bulk cleanup operations.
 
 ### Graceful Error Handling
-Add **ignoreErrors: true** to removeConnection operations to prevent failures when connections don't exist.`,
+Add **ignoreErrors: true** to removeConnection operations to prevent failures when connections don't exist.
+
+## Auto-Sanitization System
+
+### What Gets Auto-Fixed
+When ANY workflow update is made, ALL nodes in the workflow are automatically sanitized to ensure complete metadata and correct structure:
+
+1. **Operator Structure Fixes**:
+   - Binary operators (equals, contains, greaterThan, etc.) automatically have \`singleValue\` removed
+   - Unary operators (isEmpty, isNotEmpty, true, false) automatically get \`singleValue: true\` added
+   - Invalid operator structures (e.g., \`{type: "isNotEmpty"}\`) are corrected to \`{type: "boolean", operation: "isNotEmpty"}\`
+
+2. **Missing Metadata Added**:
+   - IF nodes with conditions get complete \`conditions.options\` structure if missing
+   - Switch nodes with conditions get complete \`conditions.options\` for all rules
+   - Required fields: \`{version: 2, leftValue: "", caseSensitive: true, typeValidation: "strict"}\`
+
+### Sanitization Scope
+- Runs on **ALL nodes** in the workflow, not just modified ones
+- Triggered by ANY update operation (addNode, updateNode, addConnection, etc.)
+- Prevents workflow corruption that would make UI unrenderable
+
+### Limitations
+Auto-sanitization CANNOT fix:
+- Broken connections (connections referencing non-existent nodes) - use \`cleanStaleConnections\`
+- Branch count mismatches (e.g., Switch with 3 rules but only 2 outputs) - requires manual connection fixes
+- Workflows in paradoxical corrupt states (API returns corrupt data, API rejects updates) - must recreate workflow
+
+### Recovery Guidance
+If validation still fails after auto-sanitization:
+1. Check error details for specific issues
+2. Use \`validate_workflow\` to see all validation errors
+3. For connection issues, use \`cleanStaleConnections\` operation
+4. For branch mismatches, add missing output connections
+5. For paradoxical corrupted workflows, create new workflow and migrate nodes
+
+## Automatic Connection Reference Updates
+
+When you rename a node using **updateNode**, all connection references throughout the workflow are automatically updated. Both the connection source keys and target references are updated for all connection types (main, error, ai_tool, ai_languageModel, ai_memory, etc.) and all branch configurations (IF node branches, Switch node cases, error outputs).
+
+### Basic Example
+\`\`\`javascript
+// Rename a node - connections update automatically
+n8n_update_partial_workflow({
+  id: "wf_123",
+  operations: [{
+    type: "updateNode",
+    nodeId: "node_abc",
+    updates: { name: "Data Processor" }
+  }]
+});
+// All incoming and outgoing connections now reference "Data Processor"
+\`\`\`
+
+### Multi-Output Node Example
+\`\`\`javascript
+// Rename nodes in a branching workflow
+n8n_update_partial_workflow({
+  id: "workflow_id",
+  operations: [
+    {
+      type: "updateNode",
+      nodeId: "if_node_id",
+      updates: { name: "Value Checker" }
+    },
+    {
+      type: "updateNode",
+      nodeId: "error_node_id",
+      updates: { name: "Error Handler" }
+    }
+  ]
+});
+// IF node branches and error connections automatically updated
+\`\`\`
+
+### Name Collision Protection
+Attempting to rename a node to an existing name returns a clear error:
+\`\`\`
+Cannot rename node "Old Name" to "New Name": A node with that name already exists (id: abc123...).
+Please choose a different name.
+\`\`\`
+
+### Usage Notes
+- Simply rename nodes with updateNode - no manual connection operations needed
+- Multiple renames in one call work atomically
+- Can rename a node and add/remove connections using the new name in the same batch
+- Use \`validateOnly: true\` to preview effects before applying
+
+## Removing Properties with undefined
+
+To remove a property from a node, set its value to \`undefined\` in the updates object. This is essential when migrating from deprecated properties or cleaning up optional configuration fields.
+
+### Why Use undefined?
+- **Property removal vs. null**: Setting a property to \`undefined\` removes it completely from the node object, while \`null\` sets the property to a null value
+- **Validation constraints**: Some properties are mutually exclusive (e.g., \`continueOnFail\` and \`onError\`). Simply setting one without removing the other will fail validation
+- **Deprecated property migration**: When n8n deprecates properties, you must remove the old property before the new one will work
+
+### Basic Property Removal
+\`\`\`javascript
+// Remove error handling configuration
+n8n_update_partial_workflow({
+  id: "wf_123",
+  operations: [{
+    type: "updateNode",
+    nodeName: "HTTP Request",
+    updates: { onError: undefined }
+  }]
+});
+
+// Remove disabled flag
+n8n_update_partial_workflow({
+  id: "wf_456",
+  operations: [{
+    type: "updateNode",
+    nodeId: "node_abc",
+    updates: { disabled: undefined }
+  }]
+});
+\`\`\`
+
+### Nested Property Removal
+Use dot notation to remove nested properties:
+\`\`\`javascript
+// Remove nested parameter
+n8n_update_partial_workflow({
+  id: "wf_789",
+  operations: [{
+    type: "updateNode",
+    nodeName: "API Request",
+    updates: { "parameters.authentication": undefined }
+  }]
+});
+
+// Remove entire array property
+n8n_update_partial_workflow({
+  id: "wf_012",
+  operations: [{
+    type: "updateNode",
+    nodeName: "HTTP Request",
+    updates: { "parameters.headers": undefined }
+  }]
+});
+\`\`\`
+
+### Migrating from Deprecated Properties
+Common scenario: replacing \`continueOnFail\` with \`onError\`:
+\`\`\`javascript
+// WRONG: Setting only the new property leaves the old one
+n8n_update_partial_workflow({
+  id: "wf_123",
+  operations: [{
+    type: "updateNode",
+    nodeName: "HTTP Request",
+    updates: { onError: "continueErrorOutput" }
+  }]
+});
+// Error: continueOnFail and onError are mutually exclusive
+
+// CORRECT: Remove the old property first
+n8n_update_partial_workflow({
+  id: "wf_123",
+  operations: [{
+    type: "updateNode",
+    nodeName: "HTTP Request",
+    updates: {
+      continueOnFail: undefined,
+      onError: "continueErrorOutput"
+    }
+  }]
+});
+\`\`\`
+
+### Batch Property Removal
+Remove multiple properties in one operation:
+\`\`\`javascript
+n8n_update_partial_workflow({
+  id: "wf_345",
+  operations: [{
+    type: "updateNode",
+    nodeName: "Data Processor",
+    updates: {
+      continueOnFail: undefined,
+      alwaysOutputData: undefined,
+      "parameters.legacy_option": undefined
+    }
+  }]
+});
+\`\`\`
+
+### When to Use undefined
+- Removing deprecated properties during migration
+- Cleaning up optional configuration flags
+- Resolving mutual exclusivity validation errors
+- Removing stale or unnecessary node metadata
+- Simplifying node configuration`,
     parameters: {
       id: { type: 'string', required: true, description: 'Workflow ID to update' },
       operations: {
@@ -103,10 +309,12 @@ Add **ignoreErrors: true** to removeConnection operations to prevent failures wh
         description: 'Array of diff operations. Each must have "type" field and operation-specific properties. Nodes can be referenced by ID or name.'
       },
       validateOnly: { type: 'boolean', description: 'If true, only validate operations without applying them' },
-      continueOnError: { type: 'boolean', description: 'If true, apply valid operations even if some fail (best-effort mode). Returns applied and failed operation indices. Default: false (atomic)' }
+      continueOnError: { type: 'boolean', description: 'If true, apply valid operations even if some fail (best-effort mode). Returns applied and failed operation indices. Default: false (atomic)' },
+      intent: { type: 'string', description: 'Intent of the change - helps to return better response. Include in every tool call. Example: "Add error handling for API failures".' }
     },
     returns: 'Updated workflow object or validation results if validateOnly=true',
     examples: [
+      '// Include intent parameter for better responses\nn8n_update_partial_workflow({id: "abc", intent: "Add error handling for API failures", operations: [{type: "addConnection", source: "HTTP Request", target: "Error Handler"}]})',
       '// Add a basic node (minimal configuration)\nn8n_update_partial_workflow({id: "abc", operations: [{type: "addNode", node: {name: "Process Data", type: "n8n-nodes-base.set", position: [400, 300], parameters: {}}}]})',
       '// Add node with full configuration\nn8n_update_partial_workflow({id: "def", operations: [{type: "addNode", node: {name: "Send Slack Alert", type: "n8n-nodes-base.slack", position: [600, 300], typeVersion: 2, parameters: {resource: "message", operation: "post", channel: "#alerts", text: "Success!"}}}]})',
       '// Add node AND connect it (common pattern)\nn8n_update_partial_workflow({id: "ghi", operations: [\n  {type: "addNode", node: {name: "HTTP Request", type: "n8n-nodes-base.httpRequest", position: [400, 300], parameters: {url: "https://api.example.com", method: "GET"}}},\n  {type: "addConnection", source: "Webhook", target: "HTTP Request"}\n]})',
@@ -127,11 +335,17 @@ Add **ignoreErrors: true** to removeConnection operations to prevent failures wh
       '// Connect memory to AI Agent\nn8n_update_partial_workflow({id: "ai3", operations: [{type: "addConnection", source: "Window Buffer Memory", target: "AI Agent", sourceOutput: "ai_memory"}]})',
       '// Connect output parser to AI Agent\nn8n_update_partial_workflow({id: "ai4", operations: [{type: "addConnection", source: "Structured Output Parser", target: "AI Agent", sourceOutput: "ai_outputParser"}]})',
       '// Complete AI Agent setup: Add language model, tools, and memory\nn8n_update_partial_workflow({id: "ai5", operations: [\n  {type: "addConnection", source: "OpenAI Chat Model", target: "AI Agent", sourceOutput: "ai_languageModel"},\n  {type: "addConnection", source: "HTTP Request Tool", target: "AI Agent", sourceOutput: "ai_tool"},\n  {type: "addConnection", source: "Code Tool", target: "AI Agent", sourceOutput: "ai_tool"},\n  {type: "addConnection", source: "Window Buffer Memory", target: "AI Agent", sourceOutput: "ai_memory"}\n]})',
-      '// Add fallback model to AI Agent (requires v2.1+)\nn8n_update_partial_workflow({id: "ai6", operations: [\n  {type: "addConnection", source: "OpenAI Chat Model", target: "AI Agent", sourceOutput: "ai_languageModel", targetIndex: 0},\n  {type: "addConnection", source: "Anthropic Chat Model", target: "AI Agent", sourceOutput: "ai_languageModel", targetIndex: 1}\n]})',
+      '// Add fallback model to AI Agent for reliability\nn8n_update_partial_workflow({id: "ai6", operations: [\n  {type: "addConnection", source: "OpenAI Chat Model", target: "AI Agent", sourceOutput: "ai_languageModel", targetIndex: 0},\n  {type: "addConnection", source: "Anthropic Chat Model", target: "AI Agent", sourceOutput: "ai_languageModel", targetIndex: 1}\n]})',
       '// Vector Store setup: Connect embeddings and documents\nn8n_update_partial_workflow({id: "ai7", operations: [\n  {type: "addConnection", source: "Embeddings OpenAI", target: "Pinecone Vector Store", sourceOutput: "ai_embedding"},\n  {type: "addConnection", source: "Default Data Loader", target: "Pinecone Vector Store", sourceOutput: "ai_document"}\n]})',
       '// Connect Vector Store Tool to AI Agent (retrieval setup)\nn8n_update_partial_workflow({id: "ai8", operations: [\n  {type: "addConnection", source: "Pinecone Vector Store", target: "Vector Store Tool", sourceOutput: "ai_vectorStore"},\n  {type: "addConnection", source: "Vector Store Tool", target: "AI Agent", sourceOutput: "ai_tool"}\n]})',
       '// Rewire AI Agent to use different language model\nn8n_update_partial_workflow({id: "ai9", operations: [{type: "rewireConnection", source: "AI Agent", from: "OpenAI Chat Model", to: "Anthropic Chat Model", sourceOutput: "ai_languageModel"}]})',
-      '// Replace all AI tools for an agent\nn8n_update_partial_workflow({id: "ai10", operations: [\n  {type: "removeConnection", source: "Old Tool 1", target: "AI Agent", sourceOutput: "ai_tool"},\n  {type: "removeConnection", source: "Old Tool 2", target: "AI Agent", sourceOutput: "ai_tool"},\n  {type: "addConnection", source: "New HTTP Tool", target: "AI Agent", sourceOutput: "ai_tool"},\n  {type: "addConnection", source: "New Code Tool", target: "AI Agent", sourceOutput: "ai_tool"}\n]})'
+      '// Replace all AI tools for an agent\nn8n_update_partial_workflow({id: "ai10", operations: [\n  {type: "removeConnection", source: "Old Tool 1", target: "AI Agent", sourceOutput: "ai_tool"},\n  {type: "removeConnection", source: "Old Tool 2", target: "AI Agent", sourceOutput: "ai_tool"},\n  {type: "addConnection", source: "New HTTP Tool", target: "AI Agent", sourceOutput: "ai_tool"},\n  {type: "addConnection", source: "New Code Tool", target: "AI Agent", sourceOutput: "ai_tool"}\n]})',
+      '\n// ============ REMOVING PROPERTIES EXAMPLES ============',
+      '// Remove a simple property\nn8n_update_partial_workflow({id: "rm1", operations: [{type: "updateNode", nodeName: "HTTP Request", updates: {onError: undefined}}]})',
+      '// Migrate from deprecated continueOnFail to onError\nn8n_update_partial_workflow({id: "rm2", operations: [{type: "updateNode", nodeName: "HTTP Request", updates: {continueOnFail: undefined, onError: "continueErrorOutput"}}]})',
+      '// Remove nested property\nn8n_update_partial_workflow({id: "rm3", operations: [{type: "updateNode", nodeName: "API Request", updates: {"parameters.authentication": undefined}}]})',
+      '// Remove multiple properties\nn8n_update_partial_workflow({id: "rm4", operations: [{type: "updateNode", nodeName: "Data Processor", updates: {continueOnFail: undefined, alwaysOutputData: undefined, "parameters.legacy_option": undefined}}]})',
+      '// Remove entire array property\nn8n_update_partial_workflow({id: "rm5", operations: [{type: "updateNode", nodeName: "HTTP Request", updates: {"parameters.headers": undefined}}]})'
     ],
     useCases: [
       'Rewire connections when replacing nodes',
@@ -153,6 +367,7 @@ Add **ignoreErrors: true** to removeConnection operations to prevent failures wh
     ],
     performance: 'Very fast - typically 50-200ms. Much faster than full updates as only changes are processed.',
     bestPractices: [
+      'Always include intent parameter with specific description (e.g., "Add error handling to HTTP Request node", "Fix authentication flow", "Connect Slack notification to errors"). Avoid generic phrases like "update workflow" or "partial update"',
       'Use rewireConnection instead of remove+add for changing targets',
       'Use branch="true"/"false" for IF nodes instead of sourceIndex',
       'Use case=N for Switch nodes instead of sourceIndex',
@@ -167,7 +382,11 @@ Add **ignoreErrors: true** to removeConnection operations to prevent failures wh
       'Connect language model BEFORE adding AI Agent to ensure validation passes',
       'Use targetIndex for fallback models (primary=0, fallback=1)',
       'Batch AI component connections in a single operation for atomicity',
-      'Validate AI workflows after connection changes to catch configuration errors'
+      'Validate AI workflows after connection changes to catch configuration errors',
+      'To remove properties, set them to undefined (not null) in the updates object',
+      'When migrating from deprecated properties, remove the old property and add the new one in the same operation',
+      'Use undefined to resolve mutual exclusivity validation errors between properties',
+      'Batch multiple property removals in a single updateNode operation for efficiency'
     ],
     pitfalls: [
       '**REQUIRES N8N_API_URL and N8N_API_KEY environment variables** - will not work without n8n API access',
@@ -180,8 +399,19 @@ Add **ignoreErrors: true** to removeConnection operations to prevent failures wh
       'Use "updates" property for updateNode operations: {type: "updateNode", updates: {...}}',
       'Smart parameters (branch, case) only work with IF and Switch nodes - ignored for other node types',
       'Explicit sourceIndex overrides smart parameters (branch, case) if both provided',
+      '**CRITICAL**: For If nodes, ALWAYS use branch="true"/"false" instead of sourceIndex. Using sourceIndex=0 for multiple connections will put them ALL on the TRUE branch (main[0]), breaking your workflow logic!',
+      '**CRITICAL**: For Switch nodes, ALWAYS use case=N instead of sourceIndex. Using same sourceIndex for multiple connections will put them on the same case output.',
       'cleanStaleConnections removes ALL broken connections - cannot be selective',
-      'replaceConnections overwrites entire connections object - all previous connections lost'
+      'replaceConnections overwrites entire connections object - all previous connections lost',
+      '**Auto-sanitization behavior**: Binary operators (equals, contains) automatically have singleValue removed; unary operators (isEmpty, isNotEmpty) automatically get singleValue:true added',
+      '**Auto-sanitization runs on ALL nodes**: When ANY update is made, ALL nodes in the workflow are sanitized (not just modified ones)',
+      '**Auto-sanitization cannot fix everything**: It fixes operator structures and missing metadata, but cannot fix broken connections or branch mismatches',
+      '**Corrupted workflows beyond repair**: Workflows in paradoxical states (API returns corrupt, API rejects updates) cannot be fixed via API - must be recreated',
+      'Setting a property to null does NOT remove it - use undefined instead',
+      'When properties are mutually exclusive (e.g., continueOnFail and onError), setting only the new property will fail - you must remove the old one with undefined',
+      'Removing a required property may cause validation errors - check node documentation first',
+      'Nested property removal with dot notation only removes the specific nested field, not the entire parent object',
+      'Array index notation (e.g., "parameters.headers[0]") is not supported - remove the entire array property instead'
     ],
     relatedTools: ['n8n_update_full_workflow', 'n8n_get_workflow', 'validate_workflow', 'tools_documentation']
   }

@@ -1,5 +1,7 @@
 import { z } from 'zod';
 import { WorkflowNode, WorkflowConnection, Workflow } from '../types/n8n-api';
+import { isTriggerNode, isActivatableTrigger } from '../utils/node-type-utils';
+import { isNonExecutableNode } from '../utils/node-classification';
 
 // Zod schemas for n8n API validation
 
@@ -22,17 +24,31 @@ export const workflowNodeSchema = z.object({
   executeOnce: z.boolean().optional(),
 });
 
+// Connection array schema used by all connection types
+const connectionArraySchema = z.array(
+  z.array(
+    z.object({
+      node: z.string(),
+      type: z.string(),
+      index: z.number(),
+    })
+  )
+);
+
+/**
+ * Workflow connection schema supporting all connection types.
+ * Note: 'main' is optional because AI nodes exclusively use AI-specific
+ * connection types (ai_languageModel, ai_memory, etc.) without main connections.
+ */
 export const workflowConnectionSchema = z.record(
   z.object({
-    main: z.array(
-      z.array(
-        z.object({
-          node: z.string(),
-          type: z.string(),
-          index: z.number(),
-        })
-      )
-    ),
+    main: connectionArraySchema.optional(),
+    error: connectionArraySchema.optional(),
+    ai_tool: connectionArraySchema.optional(),
+    ai_languageModel: connectionArraySchema.optional(),
+    ai_memory: connectionArraySchema.optional(),
+    ai_embedding: connectionArraySchema.optional(),
+    ai_vectorStore: connectionArraySchema.optional(),
   })
 );
 
@@ -46,6 +62,7 @@ export const workflowSettingsSchema = z.object({
   executionTimeout: z.number().optional(),
   errorWorkflow: z.string().optional(),
   callerPolicy: z.enum(['any', 'workflowsFromSameOwner', 'workflowsFromAList']).optional(),
+  availableInMCP: z.boolean().optional(),
 });
 
 // Default settings for workflow creation
@@ -87,7 +104,8 @@ export function cleanWorkflowForCreate(workflow: Partial<Workflow>): Partial<Wor
   } = workflow;
 
   // Ensure settings are present with defaults
-  if (!cleanedWorkflow.settings) {
+  // Treat empty settings object {} the same as missing settings
+  if (!cleanedWorkflow.settings || Object.keys(cleanedWorkflow.settings).length === 0) {
     cleanedWorkflow.settings = defaultWorkflowSettings;
   }
 
@@ -117,11 +135,13 @@ export function cleanWorkflowForUpdate(workflow: Workflow): Partial<Workflow> {
     createdAt,
     updatedAt,
     versionId,
+    versionCounter, // Added: n8n 1.118.1+ returns this but rejects it in updates
     meta,
     staticData,
     // Remove fields that cause API errors
     pinData,
     tags,
+    description, // Issue #431: n8n returns this field but rejects it in updates
     // Remove additional fields that n8n API doesn't accept
     isArchived,
     usedCredentials,
@@ -138,16 +158,17 @@ export function cleanWorkflowForUpdate(workflow: Workflow): Partial<Workflow> {
   //
   // PROBLEM:
   // - Some versions reject updates with settings properties (community forum reports)
-  // - Cloud versions REQUIRE settings property to be present (n8n.estyl.team)
   // - Properties like callerPolicy cause "additional properties" errors
+  // - Empty settings objects {} cause "additional properties" validation errors (Issue #431)
   //
   // SOLUTION:
   // - Filter settings to only include whitelisted properties (OpenAPI spec)
-  // - If no settings provided, use empty object {} for safety
-  // - Empty object satisfies "required property" validation (cloud API)
+  // - If no settings after filtering, omit the property entirely (n8n API rejects empty objects)
+  // - Omitting the property prevents "additional properties" validation errors
   // - Whitelisted properties prevent "additional properties" errors
   //
   // References:
+  // - Issue #431: Empty settings validation error
   // - https://community.n8n.io/t/api-workflow-update-endpoint-doesnt-support-setting-callerpolicy/161916
   // - OpenAPI spec: workflowSettings schema
   // - Tested on n8n.estyl.team (cloud) and localhost (self-hosted)
@@ -161,7 +182,9 @@ export function cleanWorkflowForUpdate(workflow: Workflow): Partial<Workflow> {
     'executionTimeout',
     'errorWorkflow',
     'timezone',
-    'executionOrder'
+    'executionOrder',
+    'callerPolicy',
+    'availableInMCP',
   ];
 
   if (cleanedWorkflow.settings && typeof cleanedWorkflow.settings === 'object') {
@@ -172,10 +195,19 @@ export function cleanWorkflowForUpdate(workflow: Workflow): Partial<Workflow> {
         filteredSettings[key] = (cleanedWorkflow.settings as any)[key];
       }
     }
-    cleanedWorkflow.settings = filteredSettings;
+
+    // n8n API requires settings to be present but rejects empty settings objects.
+    // If no valid properties remain after filtering, include minimal default settings.
+    if (Object.keys(filteredSettings).length > 0) {
+      cleanedWorkflow.settings = filteredSettings;
+    } else {
+      // Provide minimal valid settings (executionOrder v1 is the modern default)
+      cleanedWorkflow.settings = { executionOrder: 'v1' as const };
+    }
   } else {
-    // No settings provided - use empty object for safety
-    cleanedWorkflow.settings = {};
+    // No settings provided - include minimal default settings
+    // n8n API requires settings in workflow updates (v1 is the modern default)
+    cleanedWorkflow.settings = { executionOrder: 'v1' as const };
   }
 
   return cleanedWorkflow;
@@ -194,6 +226,14 @@ export function validateWorkflowStructure(workflow: Partial<Workflow>): string[]
     errors.push('Workflow must have at least one node');
   }
 
+  // Check if workflow has only non-executable nodes (sticky notes)
+  if (workflow.nodes && workflow.nodes.length > 0) {
+    const hasExecutableNodes = workflow.nodes.some(node => !isNonExecutableNode(node.type));
+    if (!hasExecutableNodes) {
+      errors.push('Workflow must have at least one executable node. Sticky notes alone cannot form a valid workflow.');
+    }
+  }
+
   if (!workflow.connections) {
     errors.push('Workflow connections are required');
   }
@@ -201,20 +241,71 @@ export function validateWorkflowStructure(workflow: Partial<Workflow>): string[]
   // Check for minimum viable workflow
   if (workflow.nodes && workflow.nodes.length === 1) {
     const singleNode = workflow.nodes[0];
-    const isWebhookOnly = singleNode.type === 'n8n-nodes-base.webhook' || 
+    const isWebhookOnly = singleNode.type === 'n8n-nodes-base.webhook' ||
                          singleNode.type === 'n8n-nodes-base.webhookTrigger';
-    
+
     if (!isWebhookOnly) {
-      errors.push('Single-node workflows are only valid for webhooks. Add at least one more node and connect them. Example: Manual Trigger → Set node');
+      errors.push(`Single non-webhook node workflow is invalid. Current node: "${singleNode.name}" (${singleNode.type}). Add another node using: {type: 'addNode', node: {name: 'Process Data', type: 'n8n-nodes-base.set', typeVersion: 3.4, position: [450, 300], parameters: {}}}`);
     }
   }
 
-  // Check for empty connections in multi-node workflows
+  // Check for disconnected nodes in multi-node workflows
   if (workflow.nodes && workflow.nodes.length > 1 && workflow.connections) {
+    // Filter out non-executable nodes (sticky notes) when counting nodes
+    const executableNodes = workflow.nodes.filter(node => !isNonExecutableNode(node.type));
     const connectionCount = Object.keys(workflow.connections).length;
-    
-    if (connectionCount === 0) {
-      errors.push('Multi-node workflow has empty connections. Connect nodes like this: connections: { "Node1 Name": { "main": [[{ "node": "Node2 Name", "type": "main", "index": 0 }]] } }');
+
+    // First check: workflow has no connections at all (only check if there are multiple executable nodes)
+    if (connectionCount === 0 && executableNodes.length > 1) {
+      const nodeNames = executableNodes.slice(0, 2).map(n => n.name);
+      errors.push(`Multi-node workflow has no connections between nodes. Add a connection using: {type: 'addConnection', source: '${nodeNames[0]}', target: '${nodeNames[1]}', sourcePort: 'main', targetPort: 'main'}`);
+    } else if (connectionCount > 0 || executableNodes.length > 1) {
+      // Second check: detect disconnected nodes (nodes with no incoming or outgoing connections)
+      const connectedNodes = new Set<string>();
+
+      // Collect all nodes that appear in connections (as source or target)
+      Object.entries(workflow.connections).forEach(([sourceName, connection]) => {
+        connectedNodes.add(sourceName); // Node has outgoing connection
+
+        if (connection.main && Array.isArray(connection.main)) {
+          connection.main.forEach((outputs) => {
+            if (Array.isArray(outputs)) {
+              outputs.forEach((target) => {
+                connectedNodes.add(target.node); // Node has incoming connection
+              });
+            }
+          });
+        }
+      });
+
+      // Find disconnected nodes (excluding non-executable nodes and triggers)
+      // Non-executable nodes (sticky notes) are UI-only and don't need connections
+      // Trigger nodes only need outgoing connections
+      const disconnectedNodes = workflow.nodes.filter(node => {
+        // Skip non-executable nodes (sticky notes, etc.) - they're UI-only annotations
+        if (isNonExecutableNode(node.type)) {
+          return false;
+        }
+
+        const isConnected = connectedNodes.has(node.name);
+        const isNodeTrigger = isTriggerNode(node.type);
+
+        // Trigger nodes only need outgoing connections
+        if (isNodeTrigger) {
+          return !workflow.connections?.[node.name]; // Disconnected if no outgoing connections
+        }
+
+        // Regular nodes need at least one connection (incoming or outgoing)
+        return !isConnected;
+      });
+
+      if (disconnectedNodes.length > 0) {
+        const disconnectedList = disconnectedNodes.map(n => `"${n.name}" (${n.type})`).join(', ');
+        const firstDisconnected = disconnectedNodes[0];
+        const suggestedSource = workflow.nodes.find(n => connectedNodes.has(n.name))?.name || workflow.nodes[0].name;
+
+        errors.push(`Disconnected nodes detected: ${disconnectedList}. Each node must have at least one connection. Add a connection: {type: 'addConnection', source: '${suggestedSource}', target: '${firstDisconnected.name}', sourcePort: 'main', targetPort: 'main'}`);
+      }
     }
   }
 
@@ -236,6 +327,16 @@ export function validateWorkflowStructure(workflow: Partial<Workflow>): string[]
     });
   }
 
+  // Validate filter-based nodes (IF v2.2+, Switch v3.2+) have complete metadata
+  if (workflow.nodes) {
+    workflow.nodes.forEach((node, index) => {
+      const filterErrors = validateFilterBasedNodeMetadata(node);
+      if (filterErrors.length > 0) {
+        errors.push(...filterErrors.map(err => `Node "${node.name}" (index ${index}): ${err}`));
+      }
+    });
+  }
+
   // Validate connections
   if (workflow.connections) {
     try {
@@ -245,12 +346,89 @@ export function validateWorkflowStructure(workflow: Partial<Workflow>): string[]
     }
   }
 
+  // Validate active workflows have activatable triggers
+  // Issue #351: executeWorkflowTrigger cannot activate a workflow
+  // It can only be invoked by other workflows
+  if ((workflow as any).active === true && workflow.nodes && workflow.nodes.length > 0) {
+    const activatableTriggers = workflow.nodes.filter(node =>
+      !node.disabled && isActivatableTrigger(node.type)
+    );
+
+    const executeWorkflowTriggers = workflow.nodes.filter(node =>
+      !node.disabled && node.type.toLowerCase().includes('executeworkflow')
+    );
+
+    if (activatableTriggers.length === 0 && executeWorkflowTriggers.length > 0) {
+      // Workflow is active but only has executeWorkflowTrigger nodes
+      const triggerNames = executeWorkflowTriggers.map(n => n.name).join(', ');
+      errors.push(
+        `Cannot activate workflow with only Execute Workflow Trigger nodes (${triggerNames}). ` +
+        'Execute Workflow Trigger can only be invoked by other workflows, not activated. ' +
+        'Either deactivate the workflow or add a webhook/schedule/polling trigger.'
+      );
+    }
+  }
+
+  // Validate Switch and IF node connection structures match their rules
+  if (workflow.nodes && workflow.connections) {
+    const switchNodes = workflow.nodes.filter(n => {
+      if (n.type !== 'n8n-nodes-base.switch') return false;
+      const mode = (n.parameters as any)?.mode;
+      return !mode || mode === 'rules'; // Default mode is 'rules'
+    });
+
+    for (const switchNode of switchNodes) {
+      const params = switchNode.parameters as any;
+      const rules = params?.rules?.rules || [];
+      const nodeConnections = workflow.connections[switchNode.name];
+
+      if (rules.length > 0 && nodeConnections?.main) {
+        const outputBranches = nodeConnections.main.length;
+
+        // Switch nodes in "rules" mode need output branches matching rules count
+        if (outputBranches !== rules.length) {
+          const ruleNames = rules.map((r: any, i: number) =>
+            r.outputKey ? `"${r.outputKey}" (index ${i})` : `Rule ${i}`
+          ).join(', ');
+
+          errors.push(
+            `Switch node "${switchNode.name}" has ${rules.length} rules [${ruleNames}] ` +
+            `but only ${outputBranches} output branch${outputBranches !== 1 ? 'es' : ''} in connections. ` +
+            `Each rule needs its own output branch. When connecting to Switch outputs, specify sourceIndex: ` +
+            rules.map((_: any, i: number) => i).join(', ') +
+            ` (or use case parameter for clarity).`
+          );
+        }
+
+        // Check for empty output branches (except trailing ones)
+        const nonEmptyBranches = nodeConnections.main.filter((branch: any[]) => branch.length > 0).length;
+        if (nonEmptyBranches < rules.length) {
+          const emptyIndices = nodeConnections.main
+            .map((branch: any[], i: number) => branch.length === 0 ? i : -1)
+            .filter((i: number) => i !== -1 && i < rules.length);
+
+          if (emptyIndices.length > 0) {
+            const ruleInfo = emptyIndices.map((i: number) => {
+              const rule = rules[i];
+              return rule.outputKey ? `"${rule.outputKey}" (index ${i})` : `Rule ${i}`;
+            }).join(', ');
+
+            errors.push(
+              `Switch node "${switchNode.name}" has unconnected output${emptyIndices.length !== 1 ? 's' : ''}: ${ruleInfo}. ` +
+              `Add connection${emptyIndices.length !== 1 ? 's' : ''} using sourceIndex: ${emptyIndices.join(' or ')}.`
+            );
+          }
+        }
+      }
+    }
+  }
+
   // Validate that all connection references exist and use node NAMES (not IDs)
   if (workflow.nodes && workflow.connections) {
     const nodeNames = new Set(workflow.nodes.map(node => node.name));
     const nodeIds = new Set(workflow.nodes.map(node => node.id));
     const nodeIdToName = new Map(workflow.nodes.map(node => [node.id, node.name]));
-    
+
     Object.entries(workflow.connections).forEach(([sourceName, connection]) => {
       // Check if source exists by name (correct)
       if (!nodeNames.has(sourceName)) {
@@ -289,10 +467,175 @@ export function validateWorkflowStructure(workflow: Partial<Workflow>): string[]
 
 // Check if workflow has webhook trigger
 export function hasWebhookTrigger(workflow: Workflow): boolean {
-  return workflow.nodes.some(node => 
-    node.type === 'n8n-nodes-base.webhook' || 
+  return workflow.nodes.some(node =>
+    node.type === 'n8n-nodes-base.webhook' ||
     node.type === 'n8n-nodes-base.webhookTrigger'
   );
+}
+
+/**
+ * Validate filter-based node metadata (IF v2.2+, Switch v3.2+)
+ * Returns array of error messages
+ */
+export function validateFilterBasedNodeMetadata(node: WorkflowNode): string[] {
+  const errors: string[] = [];
+
+  // Check if node is filter-based
+  const isIFNode = node.type === 'n8n-nodes-base.if' && node.typeVersion >= 2.2;
+  const isSwitchNode = node.type === 'n8n-nodes-base.switch' && node.typeVersion >= 3.2;
+
+  if (!isIFNode && !isSwitchNode) {
+    return errors; // Not a filter-based node
+  }
+
+  // Validate IF node
+  if (isIFNode) {
+    const conditions = (node.parameters.conditions as any);
+
+    // Check conditions.options exists
+    if (!conditions?.options) {
+      errors.push(
+        'Missing required "conditions.options". ' +
+        'IF v2.2+ requires: {version: 2, leftValue: "", caseSensitive: true, typeValidation: "strict"}'
+      );
+    } else {
+      // Validate required fields
+      const requiredFields = {
+        version: 2,
+        leftValue: '',
+        caseSensitive: 'boolean',
+        typeValidation: 'strict'
+      };
+
+      for (const [field, expectedValue] of Object.entries(requiredFields)) {
+        if (!(field in conditions.options)) {
+          errors.push(
+            `Missing required field "conditions.options.${field}". ` +
+            `Expected value: ${typeof expectedValue === 'string' ? `"${expectedValue}"` : expectedValue}`
+          );
+        }
+      }
+    }
+
+    // Validate operators in conditions
+    if (conditions?.conditions && Array.isArray(conditions.conditions)) {
+      conditions.conditions.forEach((condition: any, i: number) => {
+        const operatorErrors = validateOperatorStructure(condition.operator, `conditions.conditions[${i}].operator`);
+        errors.push(...operatorErrors);
+      });
+    }
+  }
+
+  // Validate Switch node
+  if (isSwitchNode) {
+    const rules = (node.parameters.rules as any);
+
+    if (rules?.rules && Array.isArray(rules.rules)) {
+      rules.rules.forEach((rule: any, ruleIndex: number) => {
+        // Check rule.conditions.options
+        if (!rule.conditions?.options) {
+          errors.push(
+            `Missing required "rules.rules[${ruleIndex}].conditions.options". ` +
+            'Switch v3.2+ requires: {version: 2, leftValue: "", caseSensitive: true, typeValidation: "strict"}'
+          );
+        } else {
+          // Validate required fields
+          const requiredFields = {
+            version: 2,
+            leftValue: '',
+            caseSensitive: 'boolean',
+            typeValidation: 'strict'
+          };
+
+          for (const [field, expectedValue] of Object.entries(requiredFields)) {
+            if (!(field in rule.conditions.options)) {
+              errors.push(
+                `Missing required field "rules.rules[${ruleIndex}].conditions.options.${field}". ` +
+                `Expected value: ${typeof expectedValue === 'string' ? `"${expectedValue}"` : expectedValue}`
+              );
+            }
+          }
+        }
+
+        // Validate operators in rule conditions
+        if (rule.conditions?.conditions && Array.isArray(rule.conditions.conditions)) {
+          rule.conditions.conditions.forEach((condition: any, condIndex: number) => {
+            const operatorErrors = validateOperatorStructure(
+              condition.operator,
+              `rules.rules[${ruleIndex}].conditions.conditions[${condIndex}].operator`
+            );
+            errors.push(...operatorErrors);
+          });
+        }
+      });
+    }
+  }
+
+  return errors;
+}
+
+/**
+ * Validate operator structure
+ * Ensures operator has correct format: {type, operation, singleValue?}
+ */
+export function validateOperatorStructure(operator: any, path: string): string[] {
+  const errors: string[] = [];
+
+  if (!operator || typeof operator !== 'object') {
+    errors.push(`${path}: operator is missing or not an object`);
+    return errors;
+  }
+
+  // Check required field: type (data type, not operation name)
+  if (!operator.type) {
+    errors.push(
+      `${path}: missing required field "type". ` +
+      'Must be a data type: "string", "number", "boolean", "dateTime", "array", or "object"'
+    );
+  } else {
+    const validTypes = ['string', 'number', 'boolean', 'dateTime', 'array', 'object'];
+    if (!validTypes.includes(operator.type)) {
+      errors.push(
+        `${path}: invalid type "${operator.type}". ` +
+        `Type must be a data type (${validTypes.join(', ')}), not an operation name. ` +
+        'Did you mean to use the "operation" field?'
+      );
+    }
+  }
+
+  // Check required field: operation
+  if (!operator.operation) {
+    errors.push(
+      `${path}: missing required field "operation". ` +
+      'Operation specifies the comparison type (e.g., "equals", "contains", "isNotEmpty")'
+    );
+  }
+
+  // Check singleValue based on operator type
+  if (operator.operation) {
+    const unaryOperators = ['isEmpty', 'isNotEmpty', 'true', 'false', 'isNumeric'];
+    const isUnary = unaryOperators.includes(operator.operation);
+
+    if (isUnary) {
+      // Unary operators MUST have singleValue: true
+      if (operator.singleValue !== true) {
+        errors.push(
+          `${path}: unary operator "${operator.operation}" requires "singleValue: true". ` +
+          'Unary operators do not use rightValue.'
+        );
+      }
+    } else {
+      // Binary operators should NOT have singleValue: true
+      if (operator.singleValue === true) {
+        errors.push(
+          `${path}: binary operator "${operator.operation}" should not have "singleValue: true". ` +
+          'Only unary operators (isEmpty, isNotEmpty, true, false, isNumeric) need this property.'
+        );
+      }
+    }
+  }
+
+  return errors;
 }
 
 // Get webhook URL from workflow

@@ -114,6 +114,16 @@ export interface RemoveTagOperation extends DiffOperation {
   tag: string;
 }
 
+export interface ActivateWorkflowOperation extends DiffOperation {
+  type: 'activateWorkflow';
+  // No additional properties needed - just activates the workflow
+}
+
+export interface DeactivateWorkflowOperation extends DiffOperation {
+  type: 'deactivateWorkflow';
+  // No additional properties needed - just deactivates the workflow
+}
+
 // Connection Cleanup Operations
 export interface CleanStaleConnectionsOperation extends DiffOperation {
   type: 'cleanStaleConnections';
@@ -148,6 +158,8 @@ export type WorkflowDiffOperation =
   | UpdateNameOperation
   | AddTagOperation
   | RemoveTagOperation
+  | ActivateWorkflowOperation
+  | DeactivateWorkflowOperation
   | CleanStaleConnectionsOperation
   | ReplaceConnectionsOperation;
 
@@ -170,11 +182,14 @@ export interface WorkflowDiffResult {
   success: boolean;
   workflow?: any; // Updated workflow if successful
   errors?: WorkflowDiffValidationError[];
+  warnings?: WorkflowDiffValidationError[]; // Non-blocking warnings (e.g., parameter suggestions)
   operationsApplied?: number;
   message?: string;
   applied?: number[]; // Indices of successfully applied operations (when continueOnError is true)
   failed?: number[]; // Indices of failed operations (when continueOnError is true)
   staleConnectionsRemoved?: Array<{ from: string; to: string }>; // For cleanStaleConnections operation
+  shouldActivate?: boolean; // Flag to activate workflow after update (for activateWorkflow operation)
+  shouldDeactivate?: boolean; // Flag to deactivate workflow after update (for deactivateWorkflow operation)
 }
 
 // Helper type for node reference (supports both ID and name)

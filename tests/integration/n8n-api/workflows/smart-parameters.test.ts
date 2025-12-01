@@ -19,8 +19,9 @@ import { createTestContext, TestContext, createTestWorkflowName } from '../utils
 import { getTestN8nClient } from '../utils/n8n-client';
 import { N8nApiClient } from '../../../../src/services/n8n-api-client';
 import { cleanupOrphanedWorkflows } from '../utils/cleanup-helpers';
-import { createMcpContext } from '../utils/mcp-context';
+import { createMcpContext, getMcpRepository } from '../utils/mcp-context';
 import { InstanceContext } from '../../../../src/types/instance-context';
+import { NodeRepository } from '../../../../src/database/node-repository';
 import { handleUpdatePartialWorkflow } from '../../../../src/mcp/handlers-workflow-diff';
 import { Workflow } from '../../../../src/types/n8n-api';
 
@@ -28,15 +29,21 @@ describe('Integration: Smart Parameters with Real n8n API', () => {
   let context: TestContext;
   let client: N8nApiClient;
   let mcpContext: InstanceContext;
+  let repository: NodeRepository;
 
-  beforeEach(() => {
+  beforeEach(async () => {
     context = createTestContext();
     client = getTestN8nClient();
     mcpContext = createMcpContext();
+    repository = await getMcpRepository();
+    // Skip workflow validation for these tests - they test n8n API behavior with edge cases
+    process.env.SKIP_WORKFLOW_VALIDATION = 'true';
   });
 
   afterEach(async () => {
     await context.cleanup();
+    // Clean up environment variable
+    delete process.env.SKIP_WORKFLOW_VALIDATION;
   });
 
   afterAll(async () => {
@@ -130,9 +137,11 @@ describe('Integration: Smart Parameters with Real n8n API', () => {
             }
           ]
         },
+        repository,
         mcpContext
       );
 
+      if (!result.success) console.log("VALIDATION ERROR:", JSON.stringify(result, null, 2));
       expect(result.success).toBe(true);
 
       // Fetch actual workflow from n8n API
@@ -235,6 +244,7 @@ describe('Integration: Smart Parameters with Real n8n API', () => {
             }
           ]
         },
+        repository,
         mcpContext
       );
 
@@ -367,6 +377,7 @@ describe('Integration: Smart Parameters with Real n8n API', () => {
             }
           ]
         },
+        repository,
         mcpContext
       );
 
@@ -569,6 +580,7 @@ describe('Integration: Smart Parameters with Real n8n API', () => {
             }
           ]
         },
+        repository,
         mcpContext
       );
 
@@ -705,6 +717,7 @@ describe('Integration: Smart Parameters with Real n8n API', () => {
             }
           ]
         },
+        repository,
         mcpContext
       );
 
@@ -850,6 +863,7 @@ describe('Integration: Smart Parameters with Real n8n API', () => {
             }
           ]
         },
+        repository,
         mcpContext
       );
 
@@ -954,6 +968,7 @@ describe('Integration: Smart Parameters with Real n8n API', () => {
             }
           ]
         },
+        repository,
         mcpContext
       );
 
@@ -1082,6 +1097,7 @@ describe('Integration: Smart Parameters with Real n8n API', () => {
             }
           ]
         },
+        repository,
         mcpContext
       );
 
@@ -1180,6 +1196,7 @@ describe('Integration: Smart Parameters with Real n8n API', () => {
             }
           ]
         },
+        repository,
         mcpContext
       );
 
@@ -1260,6 +1277,7 @@ describe('Integration: Smart Parameters with Real n8n API', () => {
             }
           ]
         },
+        repository,
         mcpContext
       );
 
@@ -1341,6 +1359,7 @@ describe('Integration: Smart Parameters with Real n8n API', () => {
             }
           ]
         },
+        repository,
         mcpContext
       );
 
@@ -1473,7 +1492,7 @@ describe('Integration: Smart Parameters with Real n8n API', () => {
             case: 1
           }
         ]
-      });
+      }, repository);
 
       const fetchedWorkflow = await client.getWorkflow(workflow.id);
 
@@ -1584,7 +1603,7 @@ describe('Integration: Smart Parameters with Real n8n API', () => {
             branch: 'true'
           }
         ]
-      });
+      }, repository);
 
       const fetchedWorkflow = await client.getWorkflow(workflow.id);
 
@@ -1700,7 +1719,7 @@ describe('Integration: Smart Parameters with Real n8n API', () => {
             case: 0
           }
         ]
-      });
+      }, repository);
 
       const fetchedWorkflow = await client.getWorkflow(workflow.id);
 
@@ -1838,7 +1857,7 @@ describe('Integration: Smart Parameters with Real n8n API', () => {
             case: 1
           }
         ]
-      });
+      }, repository);
 
       const fetchedWorkflow = await client.getWorkflow(workflow.id);
 
@@ -1951,7 +1970,7 @@ describe('Integration: Smart Parameters with Real n8n API', () => {
             sourceIndex: 0
           }
         ]
-      });
+      }, repository);
 
       const fetchedWorkflow = await client.getWorkflow(workflow.id);
 
@@ -2070,7 +2089,7 @@ describe('Integration: Smart Parameters with Real n8n API', () => {
             target: 'Merge'
           }
         ]
-      });
+      }, repository);
 
       const fetchedWorkflow = await client.getWorkflow(workflow.id);
 
@@ -2176,7 +2195,7 @@ describe('Integration: Smart Parameters with Real n8n API', () => {
             target: 'Merge'
           }
         ]
-      });
+      }, repository);
 
       const fetchedWorkflow = await client.getWorkflow(workflow.id);
 
@@ -2288,7 +2307,7 @@ describe('Integration: Smart Parameters with Real n8n API', () => {
             targetIndex: 0
           }
         ]
-      });
+      }, repository);
 
       const fetchedWorkflow = await client.getWorkflow(workflow.id);
 
@@ -2427,7 +2446,7 @@ describe('Integration: Smart Parameters with Real n8n API', () => {
             target: 'Merge'
           }
         ]
-      });
+      }, repository);
 
       const fetchedWorkflow = await client.getWorkflow(workflow.id);
 

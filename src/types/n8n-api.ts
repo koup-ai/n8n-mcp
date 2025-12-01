@@ -56,6 +56,7 @@ export interface WorkflowSettings {
 export interface Workflow {
   id?: string;
   name: string;
+  description?: string; // Returned by GET but must be excluded from PUT/PATCH (n8n API limitation, Issue #431)
   nodes: WorkflowNode[];
   connections: WorkflowConnection;
   active?: boolean; // Optional for creation as it's read-only
@@ -66,6 +67,7 @@ export interface Workflow {
   updatedAt?: string;
   createdAt?: string;
   versionId?: string;
+  versionCounter?: number; // Added: n8n 1.118.1+ returns this in GET responses
   meta?: {
     instanceId?: string;
   };
@@ -152,6 +154,7 @@ export interface WorkflowExport {
   tags?: string[];
   pinData?: Record<string, unknown>;
   versionId?: string;
+  versionCounter?: number; // Added: n8n 1.118.1+
   meta?: Record<string, unknown>;
 }
 

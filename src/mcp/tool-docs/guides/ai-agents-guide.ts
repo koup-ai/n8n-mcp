@@ -48,7 +48,7 @@ An n8n AI Agent workflow typically consists of:
    - Manages conversation flow
    - Decides when to use tools
    - Iterates until task is complete
-   - Supports fallback models (v2.1+)
+   - Supports fallback models for reliability
 
 3. **Language Model**: The AI brain
    - OpenAI GPT-4, Claude, Gemini, etc.
@@ -441,7 +441,7 @@ For real-time user experience:
 
 ### Pattern 2: Fallback Language Models
 
-For production reliability (requires AI Agent v2.1+):
+For production reliability with fallback language models:
 
 \`\`\`typescript
 n8n_update_partial_workflow({
@@ -690,7 +690,7 @@ n8n_validate_workflow({id: "workflow_id"})
 - **FINAL_AI_VALIDATION_SPEC.md**: Complete validation rules
 - **n8n_update_partial_workflow**: Workflow modification tool
 - **search_nodes({query: "AI", includeExamples: true})**: Find AI nodes with examples
-- **get_node_essentials({nodeType: "...", includeExamples: true})**: Node details with examples
+- **get_node({nodeType: "...", detail: "standard", includeExamples: true})**: Node details with examples
 
 ---
 
@@ -724,15 +724,14 @@ n8n_validate_workflow({id: "workflow_id"})
       'Always validate workflows after making changes',
       'AI connections require sourceOutput parameter',
       'Streaming mode has specific constraints',
-      'Some features require specific AI Agent versions (v2.1+ for fallback)'
+      'Fallback models require AI Agent node with fallback support'
     ],
     relatedTools: [
       'n8n_create_workflow',
       'n8n_update_partial_workflow',
       'n8n_validate_workflow',
       'search_nodes',
-      'get_node_essentials',
-      'list_ai_tools'
+      'get_node'
     ]
   }
 };
